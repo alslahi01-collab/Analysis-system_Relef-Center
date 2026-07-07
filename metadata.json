@@ -1,0 +1,6 @@
+{
+  "name": "نظام التحليل الإحصائي المتكامل",
+  "description": "منصة متكاملة ومرنة لتحميل وتحليل ملفات البيانات الميدانية والاستبيانات والدراسات الإحصائية مع استخلاص تقارير وتوصيات دقيقة وتصدير ملفات إكسل منسقة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
