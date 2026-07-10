@@ -1,5 +1,127 @@
 import * as XLSX from 'xlsx';
-import { DatasetProfile, ColumnProfile, FrequencyItem, CrosstabProfile, CrosstabMatrix, VariableType } from '../types';
+import { DatasetProfile, ColumnProfile, FrequencyItem, CrosstabProfile, CrosstabMatrix, VariableType, OutlierInfo } from '../types';
+
+// Arabic Data Cleaning and Standardization Pipeline
+export function cleanArabicText(text: string): string {
+  if (!text) return '';
+  let str = String(text);
+
+  // 1. Remove Tashkeel (Arabic diacritics) fully
+  const tashkeelRegex = /[\u064B-\u0652]/g;
+  str = str.replace(tashkeelRegex, '');
+
+  // 2. Remove Tatweel/Kashida (ـ)
+  str = str.replace(/\u0640/g, '');
+
+  // 3. Remove punctuation and special symbols
+  const punctuationRegex = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~،؛؟«»°•]/g;
+  str = str.replace(punctuationRegex, '');
+
+  // 4. Standardize multiple whitespaces
+  str = str.trim().replace(/\s+/g, ' ');
+
+  // 5. Basic Normalization:
+  // Unify Alefs (أ، إ، آ -> ا)
+  str = str.replace(/[أإآ]/g, 'ا');
+  // Unify Te Marbuta (ة -> ه)
+  str = str.replace(/ة/g, 'ه');
+  // Unify Ya and Alef Maksura (ى -> ي)
+  str = str.replace(/ى/g, 'ي');
+
+  // 6. Compound names handling (remove spacing inside specific name formats):
+  // served/deified names: (عبد، أمة)
+  str = str.replace(/\b(عبد|امة|امه)\s+/g, '$1');
+
+  // titles & kunyas: (أبو، أبا، أبي، بن، بنو، بني، ذو، ذا، ذي)
+  str = str.replace(/\b(ابو|أبو|ابا|أبا|ابي|أبي|بن|بنو|بني|ذو|ذا|ذي)\s+/g, '$1');
+
+  // other compounds ending in "الدين" (صلاح، سيف، نور، علاء، شمس، عماد، تقي، جاد، بهاء)
+  str = str.replace(/\b(صلاح|سيف|نور|علاء|شمس|عماد|تقي|جاد|بهاء)\s+(الدين)\b/g, '$1$2');
+
+  // Re-verify no residual duplicate spaces
+  str = str.trim().replace(/\s+/g, ' ');
+
+  return str;
+}
+
+export function cleanArabicValue(val: any): any {
+  if (val === undefined || val === null) return '';
+  if (typeof val === 'number') return val;
+  if (typeof val === 'boolean') return val;
+
+  const str = String(val);
+  // If it represents a pure number, preserve as number
+  if (str.trim() !== '' && !isNaN(Number(str))) {
+    return Number(str);
+  }
+
+  return cleanArabicText(str);
+}
+
+// Statistical Outlier Detection via Interquartile Range (IQR) Method
+export function detectOutliers(numbers: number[]): OutlierInfo | null {
+  if (numbers.length < 4) return null; // Too few data points to compute IQR reliably
+
+  const sorted = [...numbers].sort((a, b) => a - b);
+  
+  // Percentile calculation
+  const getPercentile = (arr: number[], p: number): number => {
+    const index = (arr.length - 1) * p;
+    const lower = Math.floor(index);
+    const upper = Math.ceil(index);
+    const weight = index - lower;
+    return arr[lower] * (1 - weight) + arr[upper] * weight;
+  };
+
+  const q1 = getPercentile(sorted, 0.25);
+  const q3 = getPercentile(sorted, 0.75);
+  const iqr = q3 - q1;
+
+  if (iqr === 0) return null; // No variability or all values are identical
+
+  const lowerBound = q1 - 1.5 * iqr;
+  const upperBound = q3 + 1.5 * iqr;
+
+  const outliers = numbers.filter(n => n < lowerBound || n > upperBound);
+  if (outliers.length === 0) return null;
+
+  const count = outliers.length;
+  const percentage = Number(((count / numbers.length) * 100).toFixed(2));
+
+  // Determine skew/impact on central tendency (mean vs clean mean without outliers)
+  const mean = numbers.reduce((a, b) => a + b, 0) / numbers.length;
+  const nonOutliers = numbers.filter(n => n >= lowerBound && n <= upperBound);
+  const cleanMean = nonOutliers.length > 0 
+    ? nonOutliers.reduce((a, b) => a + b, 0) / nonOutliers.length 
+    : mean;
+  
+  const meanDiff = Math.abs(mean - cleanMean);
+  const pctDiff = cleanMean > 0 ? (meanDiff / cleanMean) * 100 : 0;
+
+  let impactDescription = '';
+  let recommendation = '';
+
+  if (pctDiff > 10) {
+    impactDescription = `تأثير مرتفع جداً: القيم المتطرفة المكتشفة تزيح المتوسط الحسابي بمقدار ${meanDiff.toFixed(2)} (${pctDiff.toFixed(1)}%)، مما يؤدي لتشوه واضح في التوزيع الإحصائي.`;
+    recommendation = 'يوصى باستخدام "الوسيط (Median)" بدلاً من المتوسط الحسابي، أو عزل هذه القيم المتطرفة يدوياً لتجنب الانحياز في التقارير.';
+  } else if (pctDiff > 3) {
+    impactDescription = `تأثير متوسط: هناك إزاحة طفيفة في المتوسط الحسابي بمقدار ${meanDiff.toFixed(2)} (${pctDiff.toFixed(1)}%) بسبب هذه القيم الاستثنائية.`;
+    recommendation = 'يفضل مراجعة السجلات التي تحتوي على هذه القيم للتأكد من أنها ليست أخطاء مادية في الإدخال الميداني.';
+  } else {
+    impactDescription = 'تأثير منخفض: وجود قيم متطرفة متباعدة لا تؤثر بشكل جوهري على نزعة مركزية العمود الرقمي.';
+    recommendation = 'لا يتطلب هذا التباين إجراءً إحصائياً عاجلاً، لكن يفضل الإبقاء عليه قيد الملاحظة.';
+  }
+
+  return {
+    lowerBound: Number(lowerBound.toFixed(2)),
+    upperBound: Number(upperBound.toFixed(2)),
+    count,
+    percentage,
+    values: Array.from(new Set(outliers)).slice(0, 5), // top 5 unique outlier values
+    impactDescription,
+    recommendation
+  };
+}
 
 // Detect variable type based on column name and values
 export function detectVariableType(name: string, values: any[]): VariableType {
@@ -110,6 +232,7 @@ export function analyzeColumn(name: string, rawValues: any[], type: VariableType
       profile.stdDev = stdDev;
       profile.min = min;
       profile.max = max;
+      profile.outlierInfo = detectOutliers(numbers);
     }
   }
 
@@ -163,44 +286,66 @@ export function generateCrosstab(
     });
   });
 
-  // Calculate relationship strength and type based on deviation
-  // Measure how much row categories differ in their column distribution (conditional vs marginal)
-  let maxDeviation = 0;
+  // Deep relationship and variance checking using Chi-Square and Cramér's V
+  let chiSquare = 0;
+  const rowTotals: { [key: string]: number } = {};
+  const colTotals: { [key: string]: number } = {};
+  let grandTotal = 0;
+
   rowValues.forEach(r => {
-    colValues.forEach(c => {
-      // Find overall marginal percentage for col value
-      const marginalFreq = colCol.frequencies.find(f => f.value === c);
-      const marginalPct = marginalFreq ? marginalFreq.percentage : 0;
-      const conditionalPct = matrix[r][c].percentage;
-      const deviation = Math.abs(conditionalPct - marginalPct);
-      if (deviation > maxDeviation) {
-        maxDeviation = deviation;
-      }
-    });
+    rowTotals[r] = Object.values(matrix[r]).reduce((sum, cell) => sum + cell.count, 0);
+    grandTotal += rowTotals[r];
   });
 
+  colValues.forEach(c => {
+    let colSum = 0;
+    rowValues.forEach(r => {
+      colSum += matrix[r][c].count;
+    });
+    colTotals[c] = colSum;
+  });
+
+  if (grandTotal > 0) {
+    rowValues.forEach(r => {
+      colValues.forEach(c => {
+        const observed = matrix[r][c].count;
+        const expected = (rowTotals[r] * colTotals[c]) / grandTotal;
+        if (expected > 0) {
+          chiSquare += Math.pow(observed - expected, 2) / expected;
+        }
+      });
+    });
+  }
+
+  const numRows = rowValues.length;
+  const numCols = colValues.length;
+  const minDim = Math.min(numRows - 1, numCols - 1);
+  const cramersV = grandTotal > 0 && minDim > 0
+    ? Math.sqrt(chiSquare / (grandTotal * minDim))
+    : 0;
+
+  // Map Cramér's V to qualitative relationship strength
   let relationshipStrength: 'strong' | 'moderate' | 'weak' | 'none' = 'none';
-  if (maxDeviation > 25) {
+  if (cramersV > 0.35) {
     relationshipStrength = 'strong';
-  } else if (maxDeviation > 12) {
+  } else if (cramersV > 0.15) {
     relationshipStrength = 'moderate';
-  } else if (maxDeviation > 4) {
+  } else if (cramersV > 0.04) {
     relationshipStrength = 'weak';
   }
 
-  // Determine direction
+  // Determine direction or type of relation
   let relationshipType: 'direct' | 'inverse' | 'complex' | 'none' = 'none';
   if (relationshipStrength !== 'none') {
     if ((rowCol.type === 'numerical' || rowCol.type === 'ordinal') && 
         (colCol.type === 'numerical' || colCol.type === 'ordinal')) {
-      // Simple direct/inverse check for ordinal/numerical trends
-      relationshipType = 'direct'; // Defaulting to complex or direct for categorical
+      relationshipType = 'direct'; 
     } else {
       relationshipType = 'complex';
     }
   }
 
-  // Simple automated Arabic insight
+  // Multi-dimensional detailed insight including the exact Cramér's V and Chi-Square
   let insight = '';
   if (rowValues.length > 0 && colValues.length > 0) {
     const topRowVal = rowValues[0];
@@ -210,9 +355,11 @@ export function generateCrosstab(
     })).sort((a, b) => b.pct - a.pct);
 
     const topColVal = topColVals[0];
-    insight = `عند دراسة "${rowVar}" المتمثل في الفئة "${topRowVal}"، لوحظ أن الخيار الغالب لـ "${colVar}" هو "${topColVal.value}" بنسبة بلغت ${topColVal.pct.toFixed(2)}%، مما يشير إلى وجود ترابط (${relationshipStrength === 'strong' ? 'قوي جداً' : relationshipStrength === 'moderate' ? 'متوسط' : 'محدود'}) بين المتغيرين.`;
+    const strengthAr = relationshipStrength === 'strong' ? 'قوي جداً' : relationshipStrength === 'moderate' ? 'متوسط' : relationshipStrength === 'weak' ? 'محدود' : 'شبه منعدم';
+    
+    insight = `أظهر اختبار التباين ثنائي الأبعاد (Cramér's V = ${cramersV.toFixed(3)}) وجود ارتباط إحصائي ${strengthAr} بين المتغيرين "${rowVar}" و "${colVar}". للفئة "${topRowVal}"، يتركز الخيار الغالب لـ "${colVar}" عند "${topColVal.value}" بنسبة بلغت ${topColVal.pct.toFixed(1)}% (قيمة مربع كاي = ${chiSquare.toFixed(2)})، مما يدعم معنوية الفروق والتباين الإحصائي للعينات.`;
   } else {
-    insight = `لا توجد بيانات كافية لاستخلاص علاقة واضحة بين "${rowVar}" و "${colVar}".`;
+    insight = `لا توجد عينات مشتركة كافية لإجراء فحص الترابط والتباين لمربع كاي بين "${rowVar}" و "${colVar}".`;
   }
 
   return {
@@ -223,12 +370,96 @@ export function generateCrosstab(
     colValues,
     relationshipStrength,
     relationshipType,
-    insight
+    insight,
+    cramersV: Number(cramersV.toFixed(4)),
+    chiSquare: Number(chiSquare.toFixed(2))
   };
 }
 
+function getAgeRange(age: number): string {
+  if (isNaN(age) || age < 0) return 'غير حدد';
+  if (age <= 5) return 'من 0 إلى 5 سنوات (طفولة مبكرة)';
+  if (age <= 12) return 'من 6 إلى 12 سنة (طفولة)';
+  if (age <= 17) return 'من 13 إلى 17 سنة (يافعين)';
+  if (age <= 23) return 'من 18 إلى 23 سنة (شباب مبكر)';
+  if (age <= 35) return 'من 24 إلى 35 سنة (شباب)';
+  if (age <= 50) return 'من 36 إلى 50 سنة (كهولة/بالغين)';
+  if (age <= 65) return 'من 51 إلى 65 سنة (كبار السن)';
+  return 'أكثر من 65 سنة (مسنين)';
+}
+
+export function isPersonNamesColumn(name: string, values: any[]): boolean {
+  const n = name.toLowerCase();
+  const nameKeywords = [
+    'اسم', 'الاسم', 'أسم', 'الباحث', 'المستفيد', 'الموظف', 'العميل', 'رئيس', 'رب', 'الأسرة', 'الاسرة', 'العائلة',
+    'name', 'employee', 'customer', 'beneficiary', 'researcher', 'surveyor', 'respondent', 'head'
+  ];
+  const matchesKeyword = nameKeywords.some(k => n.includes(k));
+  
+  const nonNullValues = values.filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+  if (nonNullValues.length === 0) return false;
+  
+  const uniqueVals = new Set(nonNullValues.map(v => String(v).trim()));
+  const cardinalityRatio = uniqueVals.size / nonNullValues.length;
+  
+  // If a column matches name keywords and has a decent number of unique values, it's a names column.
+  if (matchesKeyword && uniqueVals.size > 5) {
+    return true;
+  }
+  if (cardinalityRatio > 0.85 && uniqueVals.size > 15) {
+    return true;
+  }
+  return false;
+}
+
+export function isExcludedFromCrosstab(name: string, values: any[]): boolean {
+  const n = name.toLowerCase();
+  
+  // 1. Check if it matches person names
+  if (isPersonNamesColumn(name, values)) {
+    return true;
+  }
+  
+  // 2. Check for phone numbers
+  const phoneKeywords = [
+    'هاتف', 'جوال', 'تلفون', 'موبايل', 'رقم', 'واتس', 'اتصال',
+    'phone', 'mobile', 'tel', 'whatsapp', 'contact', 'number'
+  ];
+  const hasPhoneKeyword = phoneKeywords.some(k => n.includes(k)) && !n.includes('عدد') && !n.includes('درجة') && !n.includes('فئة');
+  
+  const nonNullValues = values.filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+  if (nonNullValues.length === 0) return true;
+  
+  // Sample values
+  const sampleValues = nonNullValues.slice(0, 100).map(v => String(v).trim());
+  
+  // Phone digits pattern: check if values are mostly numeric digits/spaces/dashes of length 7-15
+  const phonePatternCount = sampleValues.filter(val => {
+    const cleaned = val.replace(/[\s+\-()]/g, '');
+    return cleaned.length >= 7 && cleaned.length <= 15 && /^\d+$/.test(cleaned);
+  }).length;
+  
+  if (phonePatternCount / sampleValues.length > 0.6 || (hasPhoneKeyword && phonePatternCount > 0)) {
+    return true;
+  }
+  
+  // 3. Check for long texts (average length of values > 25)
+  const avgLength = sampleValues.reduce((sum, val) => sum + val.length, 0) / sampleValues.length;
+  if (avgLength > 25) {
+    return true;
+  }
+  
+  // Check for unique identifier or primary key columns (high unique ratio, e.g. serial numbers, hashes, codes)
+  const uniqueVals = new Set(sampleValues);
+  if (uniqueVals.size / sampleValues.length > 0.85 && sampleValues.length > 8) {
+    return true;
+  }
+  
+  return false;
+}
+
 // Main parser to read Excel or CSV and construct profile
-export async function processFile(file: File, targetSheetName?: string): Promise<DatasetProfile> {
+export async function processFile(file: File, targetSheetName?: string, removeDuplicates: boolean = false): Promise<DatasetProfile> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
@@ -263,68 +494,135 @@ export async function processFile(file: File, targetSheetName?: string): Promise
           return Object.values(row).some(v => v !== undefined && v !== null && String(v).trim() !== '');
         });
 
-        const validRecords = validRows.length;
+        // Optional duplicate removal
+        let finalRows = validRows;
+        let removedDuplicatesCount = 0;
+        if (removeDuplicates) {
+          const seen = new Set<string>();
+          finalRows = [];
+          for (const row of validRows) {
+            const serialized = JSON.stringify(Object.keys(row).sort().reduce((acc, k) => {
+              const val = row[k] === undefined || row[k] === null ? '' : String(row[k]).trim();
+              acc[k] = val;
+              return acc;
+            }, {} as any));
+
+            if (!seen.has(serialized)) {
+              seen.add(serialized);
+              finalRows.push(row);
+            } else {
+              removedDuplicatesCount++;
+            }
+          }
+        }
+
+        const validRecords = finalRows.length;
+
+        // Keep a deep copy of original raw data rows before any cleaning
+        const originalRawDataRows = JSON.parse(JSON.stringify(finalRows));
+
+        // Clean all cell values for analysis and standardized display
+        const cleanedRows = finalRows.map((row: any) => {
+          const cleanedRow: any = {};
+          Object.keys(row).forEach(key => {
+            cleanedRow[key] = cleanArabicValue(row[key]);
+          });
+          return cleanedRow;
+        });
 
         // Get headers
         const headers = Object.keys(rows[0]);
 
-        // Build columns profile
+        // 1. Identify any age columns that are numerical and qualify for bracketing
+        const ageHeadersToBracket: string[] = [];
+        headers.forEach(header => {
+          const lowerHeader = header.toLowerCase();
+          const isAgeName = lowerHeader.includes('عمر') || lowerHeader.includes('العمر') || lowerHeader.includes('السن') || lowerHeader.includes('age');
+          const isAlreadyBracket = lowerHeader.includes('فئة') || lowerHeader.includes('نطاق') || lowerHeader.includes('range') || lowerHeader.includes('bracket');
+          
+          if (isAgeName && !isAlreadyBracket) {
+            // Check if values are mostly numerical
+            const colValues = cleanedRows.map(row => Number(row[header])).filter(n => !isNaN(n) && n > 0);
+            if (colValues.length > 0 && colValues.every(n => n >= 0 && n <= 120)) {
+              ageHeadersToBracket.push(header);
+            }
+          }
+        });
+
+        // 2. Add brackets for each identified age column
+        ageHeadersToBracket.forEach(header => {
+          const bracketHeader = `${header} (نطاقات)`;
+          cleanedRows.forEach(row => {
+            const ageVal = Number(row[header]);
+            if (row[header] !== undefined && row[header] !== null && row[header] !== '' && !isNaN(ageVal)) {
+              row[bracketHeader] = getAgeRange(ageVal);
+            } else {
+              row[bracketHeader] = 'غير محدد';
+            }
+          });
+          if (!headers.includes(bracketHeader)) {
+            headers.push(bracketHeader);
+          }
+        });
+
+        // Build columns profile using cleaned rows
         const columns: ColumnProfile[] = headers.map(header => {
-          const colValues = validRows.map(row => row[header]);
+          const colValues = cleanedRows.map(row => row[header]);
           const type = detectVariableType(header, colValues);
           return analyzeColumn(header, colValues, type);
         });
 
-        // Search for specific humanitarian/social survey indicators to prioritize bivariate crosstabs
-        const isTargetCol = (name: string, keywords: string[]) => {
-          const n = name.toLowerCase();
-          return keywords.some(k => n.includes(k));
-        };
-
-        const demoKeywords = [
-          'النوع', 'الجنس', 'جنس', 'عمر', 'العمر', 'المديرية', 'المديريات', 'المحافظة', 'المحافظات', 
-          'المنطقة', 'المناطق', 'العزل', 'الحارة', 'القرية', 'gender', 'age', 'district', 'governorate', 'village', 'region'
-        ];
-        
-        const riskKeywords = [
-          'إعاقة', 'الاعاقة', 'عاهة', 'صعوبة', 'مخاطر', 'حماية', 'تهديد', 'مخاطر الحماية', 
-          'مصدر الدخل', 'الدخل', 'العمل', 'مساعدات', 'دخل', 'معيشي', 'disability', 'risk', 'protection', 'income', 'need'
-        ];
-
-        const priorityDemos = columns.filter(c => isTargetCol(c.name, demoKeywords) && c.frequencies.length <= 15);
-        const priorityRisks = columns.filter(c => isTargetCol(c.name, riskKeywords) && c.frequencies.length <= 10);
+        // Filter out columns containing people's names, phone numbers, or long texts from crosstabs
+        const eligibleColumns = columns.filter(col => {
+          const colValues = cleanedRows.map(row => row[col.name]);
+          return !isExcludedFromCrosstab(col.name, colValues);
+        });
 
         const crosstabs: CrosstabProfile[] = [];
 
-        // 1. Try to pair priority risks (rows) with priority demographics (cols)
-        priorityRisks.forEach(riskCol => {
-          priorityDemos.forEach(demoCol => {
-            if (riskCol.name !== demoCol.name && crosstabs.length < 12) {
-              crosstabs.push(generateCrosstab(riskCol, demoCol, validRows));
+        // Identify candidate variables for relations study
+        const relationCandidates = eligibleColumns.filter(c => 
+          (c.type === 'demographic' || c.type === 'categorical' || c.type === 'ordinal' || c.type === 'boolean') &&
+          c.frequencies.length >= 2 && c.frequencies.length <= 15
+        );
+
+        // Prioritize demographic variables to compare against others
+        const demoCols = relationCandidates.filter(c => 
+          c.type === 'demographic' || 
+          c.name.includes('النوع') || c.name.includes('جنس') || 
+          c.name.includes('عمر') || c.name.includes('نطاقات') || 
+          c.name.includes('منطقة') || c.name.includes('محافظة')
+        );
+        
+        const otherCols = relationCandidates.filter(c => !demoCols.some(dc => dc.name === c.name));
+
+        // 1. Cross match demo variables with other variables (broader and deeper)
+        demoCols.forEach(demo => {
+          otherCols.forEach(other => {
+            if (demo.name !== other.name && crosstabs.length < 24) {
+              crosstabs.push(generateCrosstab(other, demo, cleanedRows));
             }
           });
         });
 
-        // 2. Standard pairing if list is empty or small
-        if (crosstabs.length < 4) {
-          const demographicCols = columns.filter(c => c.type === 'demographic' || (c.type === 'categorical' && c.frequencies.length <= 6));
-          const topDemos = demographicCols.slice(0, 3);
-          const topDeps = columns.filter(c => c.type === 'ordinal' || c.type === 'boolean' || (c.type === 'categorical' && !topDemos.some(td => td.name === c.name))).slice(0, 4);
-
-          topDeps.forEach(dep => {
-            topDemos.forEach(demo => {
-              if (dep.name !== demo.name && !crosstabs.some(ct => ct.rowVar === dep.name && ct.colVar === demo.name)) {
-                crosstabs.push(generateCrosstab(dep, demo, validRows));
+        // 2. Cross match remaining columns amongst themselves to make it extremely comprehensive
+        if (crosstabs.length < 15) {
+          relationCandidates.forEach(colA => {
+            relationCandidates.forEach(colB => {
+              if (colA.name !== colB.name && crosstabs.length < 24) {
+                if (!crosstabs.some(ct => (ct.rowVar === colA.name && ct.colVar === colB.name) || (ct.rowVar === colB.name && ct.colVar === colA.name))) {
+                  crosstabs.push(generateCrosstab(colA, colB, cleanedRows));
+                }
               }
             });
           });
         }
 
-        // 3. Fallback to guarantee at least one crosstab
-        if (crosstabs.length === 0 && columns.length >= 2) {
-          const catCols = columns.filter(c => c.frequencies.length > 0 && c.frequencies.length <= 10);
+        // 3. Fallback to guarantee at least one crosstab from eligible columns
+        if (crosstabs.length === 0 && eligibleColumns.length >= 2) {
+          const catCols = eligibleColumns.filter(c => c.frequencies.length > 0 && c.frequencies.length <= 12);
           if (catCols.length >= 2) {
-            crosstabs.push(generateCrosstab(catCols[0], catCols[1], validRows));
+            crosstabs.push(generateCrosstab(catCols[0], catCols[1], cleanedRows));
           }
         }
 
@@ -336,7 +634,9 @@ export async function processFile(file: File, targetSheetName?: string): Promise
           crosstabs,
           sheetNames,
           selectedSheet,
-          rawDataRows: validRows
+          rawDataRows: cleanedRows,
+          originalRawDataRows,
+          removedDuplicatesCount
         });
 
       } catch (err: any) {
@@ -651,6 +951,18 @@ export function exportToFinalExcel(
   ];
   const ws5 = XLSX.utils.aoa_to_sheet(conclusionData);
   XLSX.utils.book_append_sheet(wb, ws5, 'الاستنتاجات والتوصيات');
+
+  // Sheet 7: البيانات المنظفة
+  if (profile.rawDataRows && profile.rawDataRows.length > 0) {
+    const wsCleaned = XLSX.utils.json_to_sheet(profile.rawDataRows);
+    XLSX.utils.book_append_sheet(wb, wsCleaned, 'البيانات المنظفة');
+  }
+
+  // Sheet 8: البيانات الأصلية
+  if (profile.originalRawDataRows && profile.originalRawDataRows.length > 0) {
+    const wsOriginal = XLSX.utils.json_to_sheet(profile.originalRawDataRows);
+    XLSX.utils.book_append_sheet(wb, wsOriginal, 'البيانات الأصلية');
+  }
 
   // Trigger download
   XLSX.writeFile(wb, `التقرير_الإحصائي_النهائي_${profile.fileName.split('.')[0]}.xlsx`);

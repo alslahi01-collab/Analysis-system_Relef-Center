@@ -6,6 +6,16 @@ export interface FrequencyItem {
 
 export type VariableType = 'demographic' | 'categorical' | 'ordinal' | 'boolean' | 'numerical' | 'text';
 
+export interface OutlierInfo {
+  lowerBound: number;
+  upperBound: number;
+  count: number;
+  percentage: number;
+  values: number[];
+  impactDescription: string;
+  recommendation: string;
+}
+
 export interface ColumnProfile {
   name: string;
   type: VariableType;
@@ -18,6 +28,7 @@ export interface ColumnProfile {
   stdDev?: number;
   min?: number;
   max?: number;
+  outlierInfo?: OutlierInfo | null;
 }
 
 export interface CrosstabMatrix {
@@ -38,6 +49,8 @@ export interface CrosstabProfile {
   relationshipStrength: 'strong' | 'moderate' | 'weak' | 'none';
   relationshipType: 'direct' | 'inverse' | 'complex' | 'none';
   insight: string;
+  cramersV?: number;
+  chiSquare?: number;
 }
 
 export interface DatasetProfile {
@@ -49,6 +62,8 @@ export interface DatasetProfile {
   sheetNames?: string[];
   selectedSheet?: string;
   rawDataRows?: any[];
+  originalRawDataRows?: any[];
+  removedDuplicatesCount?: number;
 }
 
 export interface AnalysisReport {

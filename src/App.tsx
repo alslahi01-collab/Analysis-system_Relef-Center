@@ -1,5 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
 import { 
   Upload, 
   FileSpreadsheet, 
@@ -19,7 +21,9 @@ import {
   Sparkles,
   Layers,
   Palette,
-  Grid
+  Grid,
+  Search,
+  Printer
 } from 'lucide-react';
 import { 
   ResponsiveContainer, 
@@ -51,6 +55,62 @@ const PALETTE_COLORS: { [key: string]: string[] } = {
 };
 
 const CHART_COLORS = PALETTE_COLORS.blue;
+
+const modernColorCache = new Map<string, string>();
+
+function convertModernColorToRgb(colorStr: string): string {
+  if (modernColorCache.has(colorStr)) {
+    return modernColorCache.get(colorStr)!;
+  }
+  
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return 'rgb(59, 130, 246)';
+    
+    ctx.fillStyle = colorStr;
+    ctx.fillRect(0, 0, 1, 1);
+    const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+    const result = a === 255 
+      ? `rgb(${r}, ${g}, ${b})` 
+      : `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(2)})`;
+      
+    modernColorCache.set(colorStr, result);
+    return result;
+  } catch (e) {
+    return 'rgb(59, 130, 246)';
+  }
+}
+
+function replaceModernColors(str: string): string {
+  if (typeof str !== 'string') return str;
+  if (!str.includes('oklch') && !str.includes('oklab')) return str;
+  return str.replace(/(oklch|oklab)\([^)]+\)/g, (match) => {
+    return convertModernColorToRgb(match);
+  });
+}
+
+const CustomTooltip = ({ active, payload }: any) => {
+  if (active && payload && payload.length) {
+    const data = payload[0].payload;
+    return (
+      <div className="bg-slate-950/95 text-white p-3 rounded-2xl shadow-xl border border-slate-800 text-right text-xs space-y-1.5 font-sans backdrop-blur-sm z-50" dir="rtl">
+        <p className="font-bold text-slate-100 border-b border-slate-800 pb-2 mb-2 text-xs">{data.name}</p>
+        <p className="flex items-center gap-6 justify-between">
+          <span className="text-slate-400 font-semibold">حجم العينة الفعلي:</span>
+          <span className="font-mono font-black text-amber-400 text-[13px]">{data['التكرار']} سجل</span>
+        </p>
+        <p className="flex items-center gap-6 justify-between">
+          <span className="text-slate-400 font-semibold">النسبة المئوية الدقيقة:</span>
+          <span className="font-mono font-black text-blue-400 text-[13px]">{(data['النسبة المئوية (%)'] || 0).toFixed(2)}%</span>
+        </p>
+      </div>
+    );
+  }
+  return null;
+};
 
 // Highly realistic Arabic demo dataset
 const DEMO_FILE_NAME = "مسح_تقييم_الاحتياجات_الميدانية_للعائلات_النازحة.xlsx";
@@ -88,12 +148,162 @@ export default function App() {
   const [paletteName, setPaletteName] = useState<string>('blue');
   const [showGridlines, setShowGridlines] = useState<boolean>(true);
 
+  // New States for requested enhancements
+  const [removeDuplicates, setRemoveDuplicates] = useState<boolean>(true);
+  const [columnSearchQuery, setColumnSearchQuery] = useState<string>('');
+  const [viewMode, setViewMode] = useState<'tabs' | 'full'>('tabs');
+  const [activeTab, setActiveTab] = useState<'summary' | 'univariate' | 'bivariate' | 'aggregated'>('summary');
+  const [showDuplicateNotification, setShowDuplicateNotification] = useState<boolean>(false);
+  const [duplicateCountMsg, setDuplicateCountMsg] = useState<string>('');
+  const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
+
   // Active variable selected for Univariate Analysis
   const [selectedVar, setSelectedVar] = useState<string>('');
 
   // Active variables selected for Bivariate (Crosstab) Analysis
   const [crossRowVar, setCrossRowVar] = useState<string>('');
   const [crossColVar, setCrossColVar] = useState<string>('');
+
+  const [exportingCrosstab, setExportingCrosstab] = useState(false);
+
+  const handleExportCrosstab = async (format: 'png' | 'pdf') => {
+    const container = document.getElementById('crosstab-export-container');
+    if (!container || !activeCrosstab) return;
+
+    setExportingCrosstab(true);
+    try {
+      // Create a canvas from the element
+      const canvas = await html2canvas(container, {
+        scale: 2.5, // High resolution
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+        onclone: (clonedDoc) => {
+          // Adjust any elements if needed inside cloned view (e.g. ensure scrollbar container is fully expanded)
+          const el = clonedDoc.getElementById('crosstab-export-container');
+          if (el) {
+            el.style.padding = '24px';
+            el.style.borderRadius = '16px';
+            el.style.border = 'none';
+          }
+
+          // Convert all loaded styleSheets to inlined/cleaned style tags in clonedDoc
+          try {
+            for (let i = 0; i < document.styleSheets.length; i++) {
+              const sheet = document.styleSheets[i];
+              try {
+                let cssText = '';
+                for (let j = 0; j < sheet.cssRules.length; j++) {
+                  cssText += sheet.cssRules[j].cssText + '\n';
+                }
+                if (cssText) {
+                  const styleNode = clonedDoc.createElement('style');
+                  styleNode.textContent = replaceModernColors(cssText);
+                  clonedDoc.head.appendChild(styleNode);
+                }
+              } catch (e) {
+                // Ignore cross-origin stylesheet reading restrictions
+              }
+            }
+            
+            // Remove the link stylesheets so html2canvas doesn't fetch/parse raw oklch/oklab styles
+            const links = clonedDoc.querySelectorAll('link[rel="stylesheet"]');
+            links.forEach(link => link.parentNode?.removeChild(link));
+          } catch (e) {
+            console.error('Error processing styleSheets in clone:', e);
+          }
+
+          // Override getComputedStyle on the cloned document's window to intercept and convert oklch and oklab
+          const win = clonedDoc.defaultView;
+          if (win) {
+            const origGetComputedStyle = win.getComputedStyle;
+            win.getComputedStyle = function (elt, pseudoElt) {
+              const style = origGetComputedStyle.call(win, elt, pseudoElt);
+              return new Proxy(style, {
+                get(target, prop) {
+                  if (prop === 'getPropertyValue') {
+                    return (property: string) => {
+                      const val = target.getPropertyValue(property);
+                      return replaceModernColors(val);
+                    };
+                  }
+                  const val = target[prop as any];
+                  if (typeof val === 'string') {
+                    return replaceModernColors(val);
+                  }
+                  if (typeof val === 'function') {
+                    return val.bind(target);
+                  }
+                  return val;
+                }
+              });
+            };
+          }
+
+          // Clean up any existing style tags containing oklch or oklab
+          const styles = clonedDoc.querySelectorAll('style');
+          styles.forEach(style => {
+            if (style.textContent && (style.textContent.includes('oklch') || style.textContent.includes('oklab'))) {
+              style.textContent = replaceModernColors(style.textContent);
+            }
+          });
+
+          // Clean up inline styles containing oklch or oklab
+          const allElements = clonedDoc.querySelectorAll('*');
+          allElements.forEach((node: any) => {
+            if (node.style) {
+              // Iterate over all style keys
+              for (let i = 0; i < node.style.length; i++) {
+                const key = node.style[i];
+                const val = node.style.getPropertyValue(key);
+                if (val && (val.includes('oklch') || val.includes('oklab'))) {
+                  node.style.setProperty(key, replaceModernColors(val));
+                }
+              }
+              // Shorthand checks
+              ['color', 'backgroundColor', 'borderColor', 'fill', 'stroke'].forEach(prop => {
+                const val = node.style[prop];
+                if (val && typeof val === 'string' && (val.includes('oklch') || val.includes('oklab'))) {
+                  node.style[prop] = replaceModernColors(val);
+                }
+              });
+            }
+          });
+        }
+      });
+
+      const imgData = canvas.toDataURL('image/png');
+      const fileName = `تحليل_العلاقات_${activeCrosstab.rowVar}_حسب_${activeCrosstab.colVar}`;
+
+      if (format === 'png') {
+        const link = document.createElement('a');
+        link.download = `${fileName}.png`;
+        link.href = imgData;
+        link.click();
+      } else {
+        // PDF Export - Landscape orientation
+        const pdf = new jsPDF('l', 'mm', 'a4');
+        const pdfWidth = pdf.internal.pageSize.getWidth();
+        const pdfHeight = pdf.internal.pageSize.getHeight();
+        
+        const imgWidth = canvas.width;
+        const imgHeight = canvas.height;
+        const ratio = Math.min(pdfWidth / (imgWidth / 2.834), pdfHeight / (imgHeight / 2.834));
+        const finalWidth = (imgWidth / 2.834) * ratio;
+        const finalHeight = (imgHeight / 2.834) * ratio;
+        
+        const xOffset = (pdfWidth - finalWidth) / 2;
+        const yOffset = (pdfHeight - finalHeight) / 2;
+
+        pdf.addImage(imgData, 'PNG', xOffset, yOffset, finalWidth, finalHeight);
+        pdf.save(`${fileName}.pdf`);
+      }
+    } catch (err) {
+      console.error('Error exporting crosstab:', err);
+    } finally {
+      setExportingCrosstab(false);
+    }
+  };
 
   // Handle Drag & Drop Events
   const handleDrag = (e: React.DragEvent) => {
@@ -122,17 +332,279 @@ export default function App() {
     }
   };
 
+  const handlePrint = () => {
+    try {
+      const isInIframe = window.self !== window.top;
+      if (isInIframe) {
+        setShowPrintModal(true);
+      } else {
+        window.print();
+      }
+    } catch (err) {
+      console.error(err);
+      setShowPrintModal(true);
+    }
+  };
+
+  // Auto-restore custom settings for the current file from localStorage
+  React.useEffect(() => {
+    if (!profile) return;
+    const saved = localStorage.getItem(`analysis_settings_${profile.fileName}`);
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed.excludedColumns)) {
+          setExcludedColumns(parsed.excludedColumns);
+        }
+        if (parsed.paletteName) {
+          setPaletteName(parsed.paletteName);
+        }
+      } catch (e) {
+        console.error("Error reading saved settings from localStorage:", e);
+      }
+    }
+  }, [profile]);
+
+  // Auto-save settings whenever excludedColumns or paletteName changes for the current file
+  React.useEffect(() => {
+    if (!profile) return;
+    const settings = {
+      excludedColumns,
+      paletteName
+    };
+    localStorage.setItem(`analysis_settings_${profile.fileName}`, JSON.stringify(settings));
+  }, [excludedColumns, paletteName, profile]);
+
+  const handleExportAsWord = () => {
+    if (!profile) return;
+    
+    setLoading(true);
+    setLoadingStep('جاري تصدير التقرير الميداني الشامل مع الرسوم البيانية التوضيحية بصيغة Word (.docx)...');
+    
+    try {
+      // Helper to generate beautifully styled, MS-Word compatible charts using nested table structures for bulletproof rendering
+      const generateWordChartHtml = (col: ColumnProfile) => {
+        const redShades = [
+          '#d81a21', // Primary Danish Refugee Council (DRC) Red
+          '#b01217', // Darker Red / Crimson
+          '#e54e53', // Bright Warm Red
+          '#8a0c10', // Deep Burgundy
+          '#f26b70', // Pastel Red-Orange
+          '#c1121f', // Vibrant Crimson
+          '#f9bec0'  // Soft Accent Pink
+        ];
+        
+        const total = col.frequencies.reduce((sum, f) => sum + f.count, 0);
+        if (total === 0) return '';
+
+        // Case 1: Binary/Ternary variables (1-3 categories) - use a modern Stacked Single-Line Percentage Bar Chart
+        if (col.frequencies.length > 0 && col.frequencies.length <= 3) {
+          return `
+            <div style="margin-top: 10px; margin-bottom: 25px; border: 1px solid #e2e8f0; padding: 15px; border-radius: 8px; background-color: #fafafa; font-family: 'Segoe UI', Tahoma, Arial, sans-serif;" dir="rtl">
+              <p style="color: #d81a21; font-weight: bold; font-size: 11pt; margin-top: 0; margin-bottom: 12px; border-bottom: 2px solid #eaeaea; padding-bottom: 6px;">
+                📊 مخطط التوزيع المئوي المتراكم: "${col.name}" (توزيع مدمج)
+              </p>
+              
+              <!-- Segment Bar -->
+              <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; border: 1px solid #cbd5e1; border-radius: 6px; overflow: hidden;">
+                <tr style="height: 32px;">
+                  ${col.frequencies.map((f, idx) => {
+                    const pct = f.percentage;
+                    if (pct < 0.1) return '';
+                    const color = redShades[idx % redShades.length];
+                    return `
+                      <td width="${pct.toFixed(0)}%" style="background-color: ${color}; text-align: center; color: #ffffff; font-size: 9.5pt; font-weight: bold; padding: 5px; border: none;">
+                        ${pct >= 10 ? `${f.value} (${pct.toFixed(1)}%)` : ''}
+                      </td>
+                    `;
+                  }).join('')}
+                </tr>
+              </table>
+
+              <!-- Data labels details -->
+              <table style="width: 100%; border: none; font-size: 9.5pt; border-collapse: collapse;">
+                <tr>
+                  ${col.frequencies.map((f, idx) => {
+                    const color = redShades[idx % redShades.length];
+                    return `
+                      <td style="border: none; padding: 4px; text-align: right; vertical-align: middle;">
+                        <span style="display: inline-block; width: 12px; height: 12px; background-color: ${color}; border-radius: 3px; margin-left: 8px; vertical-align: middle;">&nbsp;&nbsp;&nbsp;</span>
+                        <strong style="color: #1e293b;">${f.value}:</strong> 
+                        <span style="font-weight: bold; color: #d81a21; font-size: 10pt;">${f.count} سجل</span>
+                        <span style="color: #64748b; font-size: 9pt;">(${f.percentage.toFixed(1)}%)</span>
+                      </td>
+                    `;
+                  }).join('')}
+                </tr>
+              </table>
+            </div>
+          `;
+        }
+
+        // Case 2: Multi-category variables - use an Elegant Horizontal Bar Chart (مناسب جداً للترتيب والتكرارات)
+        return `
+          <div style="margin-top: 10px; margin-bottom: 25px; border: 1px solid #e2e8f0; padding: 15px; border-radius: 8px; background-color: #fafafa; font-family: 'Segoe UI', Tahoma, Arial, sans-serif;" dir="rtl">
+            <p style="color: #d81a21; font-weight: bold; font-size: 11pt; margin-top: 0; margin-bottom: 12px; border-bottom: 2px solid #eaeaea; padding-bottom: 6px;">
+              📊 مخطط الأعمدة البيانية الأفقي: "${col.name}"
+            </p>
+            <table style="width: 100%; border: none; border-collapse: collapse; margin: 0;">
+              ${col.frequencies.map((f, idx) => {
+                const pct = Math.max(1, Math.min(100, f.percentage));
+                const color = redShades[idx % redShades.length];
+                return `
+                  <tr style="border: none;">
+                    <!-- Category Label -->
+                    <td style="width: 25%; text-align: right; padding: 8px 0; font-size: 9.5pt; color: #1e293b; border: none; font-weight: bold; vertical-align: middle; line-height: 1.2;">
+                      ${f.value}
+                    </td>
+                    <!-- Bar cell -->
+                    <td style="width: 58%; padding: 8px 15px; border: none; vertical-align: middle;">
+                      <table style="width: 100%; background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 4px; border-collapse: collapse; margin: 0;">
+                        <tr>
+                          <td style="padding: 0; border: none; font-size: 1px; line-height: 1px;">
+                            <table width="${pct.toFixed(0)}%" style="background-color: ${color}; border: none; border-collapse: collapse; margin: 0; border-radius: 2px;">
+                              <tr>
+                                <td style="padding: 5px 8px; border: none; text-align: left; color: #ffffff; font-size: 8.5pt; font-weight: bold; line-height: 12px;">
+                                  ${pct >= 15 ? `${f.percentage.toFixed(1)}%` : ''}
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                      </table>
+                    </td>
+                    <!-- Exact Count & Percent Labels -->
+                    <td style="width: 17%; text-align: left; padding: 8px 0; font-size: 9.5pt; color: #1e293b; border: none; font-weight: bold; vertical-align: middle;">
+                      <span style="color: #d81a21;">${f.count} سجل</span>
+                      ${pct < 15 ? `<span style="color: #64748b; font-size: 8.5pt; font-weight: normal;"> (${f.percentage.toFixed(1)}%)</span>` : ''}
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </table>
+          </div>
+        `;
+      };
+
+      // Assemble clean HTML representation of the full report in beautiful Arabic styling with DRC deep red highlights
+      const docHtml = `
+        <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+        <head>
+          <title>التقرير الإحصائي الميداني</title>
+          <meta charset="utf-8">
+          <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; direction: rtl; text-align: right; line-height: 1.6; color: #333333; }
+            h1 { color: #d81a21; font-size: 24pt; border-bottom: 3px solid #d81a21; padding-bottom: 12px; margin-bottom: 20px; }
+            h2 { color: #9b1c1c; font-size: 18pt; margin-top: 30px; border-bottom: 1.5px solid #d81a21; padding-bottom: 6px; }
+            h3 { color: #1e293b; font-size: 13pt; margin-top: 25px; margin-bottom: 10px; border-right: 4px solid #d81a21; padding-right: 10px; }
+            p { font-size: 11pt; margin-bottom: 15px; text-align: justify; }
+            table { width: 100%; border-collapse: collapse; margin: 15px 0; font-size: 10pt; }
+            th { background-color: #f8fafc; color: #d81a21; font-weight: bold; padding: 10px; border: 1px solid #cbd5e1; text-align: right; }
+            td { padding: 10px; border: 1px solid #cbd5e1; }
+            tr:nth-child(even) { background-color: #fdfafb; }
+            .badge { background-color: #fde8e8; color: #9b1c1c; padding: 3px 8px; border-radius: 4px; font-size: 9pt; font-weight: bold; }
+            .section-box { background-color: #fcfcfc; border: 1px solid #eaeaea; border-right: 5px solid #d81a21; padding: 15px; border-radius: 6px; margin-bottom: 20px; }
+            .meta-info { color: #475569; font-size: 10.5pt; margin-bottom: 25px; background-color: #f8fafc; padding: 12px; border-radius: 6px; border: 1px solid #e2e8f0; }
+          </style>
+        </head>
+        <body>
+          <h1>التقرير الميداني الشامل وتحليل البيانات الإحصائية</h1>
+          <div class="meta-info">
+            <p><strong>اسم الملف المصدري:</strong> ${profile.fileName}</p>
+            <p><strong>الجهة المستفيدة:</strong> المجلس الدنماركي للاجئين (DRC) - شركاء العمل الإنساني</p>
+            <p><strong>حجم العينة الإجمالي:</strong> ${profile.totalRecords} سجل</p>
+            <p><strong>عدد السجلات الصالحة للتحليل:</strong> ${profile.validRecords} سجل</p>
+            <p><strong>تاريخ إصدار التقرير:</strong> ${new Date().toLocaleDateString('ar-EG', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+          </div>
+
+          <h2>أولاً: الملخص التنفيذي والنتائج الرئيسية</h2>
+          <div class="section-box">
+            <p>${(report?.executiveSummary || "لم يتم توليد الملخص بعد").replace(/\n/g, '<br>')}</p>
+          </div>
+
+          <h2>ثانياً: المنهجية المتبعة وفحص جودة البيانات</h2>
+          <div class="section-box">
+            <p>${(report?.methodology || "لم يتم توليد المنهجية بعد").replace(/\n/g, '<br>')}</p>
+          </div>
+
+          <h2>ثالثاً: التحليل الإحصائي الوصفي وتوزيع المتغيرات الميدانية والرسوم التوضيحية</h2>
+          ${(profile?.columns || []).filter(c => !excludedColumns.includes(c.name)).map(col => `
+            <h3>المتغير: ${col.name}</h3>
+            <p style="margin-bottom: 8px;"><strong>النوع الإحصائي للبيانات:</strong> <span class="badge">${col.type === 'numerical' ? 'رقمي كمي' : col.type === 'demographic' ? 'ديموغرافي' : 'تصنيفي فئات'}</span></p>
+            
+            <!-- Statistical Table -->
+            <table>
+              <thead>
+                <tr>
+                  <th>الفئة / الخيار</th>
+                  <th>التكرار (N)</th>
+                  <th>النسبة المئوية (%)</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${col.frequencies.map(f => `
+                  <tr>
+                    <td><strong>${f.value}</strong></td>
+                    <td>${f.count} سجل</td>
+                    <td>${f.percentage.toFixed(2)}%</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+
+            <!-- Embedded Red Graphic Chart designed specifically for MS Word -->
+            ${generateWordChartHtml(col)}
+          `).join('')}
+
+          <h2>رابعاً: الترابط والتباين المقارن (التحليل المقارن والعلاقات)</h2>
+          <div class="section-box">
+            <p>${(report?.relationshipsAnalysis || "لم يتم فحص العلاقات الثنائية بعد").replace(/\n/g, '<br>')}</p>
+          </div>
+
+          <h2>خامساً: الاستنتاجات والتوصيات الميدانية المقترحة</h2>
+          <div class="section-box">
+            <p>${(report?.conclusionsAndRecommendations || "لم يتم صياغة التوصيات بعد").replace(/\n/g, '<br>')}</p>
+          </div>
+        </body>
+        </html>
+      `;
+      
+      const blob = new Blob(['\ufeff' + docHtml], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const sanitizedName = profile.fileName.replace(/\.[^/.]+$/, "");
+      link.download = `تقرير_التحليل_الميداني_${sanitizedName}.docx`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Error generating Word document:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // Run data processor and server analysis
-  const processUploadedFile = async (file: File) => {
+  const processUploadedFile = async (file: File, overrideRemoveDuplicates?: boolean) => {
     setError(null);
     setLoading(true);
     setUploadedFile(file); // Store the uploaded File reference
     setExcludedColumns([]); // Reset exclusions
     setLoadingStep('تحميل وقراءة هيكل البيانات...');
 
+    const shouldRemoveDup = overrideRemoveDuplicates !== undefined ? overrideRemoveDuplicates : removeDuplicates;
+
     try {
-      const resultProfile = await processFile(file);
+      const resultProfile = await processFile(file, undefined, shouldRemoveDup);
       setProfile(resultProfile);
+
+      // Trigger duplicate notification if duplicates were found/removed
+      if (shouldRemoveDup && resultProfile.removedDuplicatesCount && resultProfile.removedDuplicatesCount > 0) {
+        setDuplicateCountMsg(`تم رصد وإزالة ${resultProfile.removedDuplicatesCount} سجلاً مكرراً بالكامل من الملف لتحسين جودة التحليل ودقة التكرارات.`);
+        setShowDuplicateNotification(true);
+      } else {
+        setShowDuplicateNotification(false);
+      }
 
       // Default variables for views
       if (resultProfile.columns.length > 0) {
@@ -158,8 +630,15 @@ export default function App() {
     setExcludedColumns([]); // Reset exclusions
     setLoadingStep(`جاري تحميل وقراءة ورقة العمل "${sheetName}"...`);
     try {
-      const resultProfile = await processFile(uploadedFile, sheetName);
+      const resultProfile = await processFile(uploadedFile, sheetName, removeDuplicates);
       setProfile(resultProfile);
+
+      if (removeDuplicates && resultProfile.removedDuplicatesCount && resultProfile.removedDuplicatesCount > 0) {
+        setDuplicateCountMsg(`تم رصد وإزالة ${resultProfile.removedDuplicatesCount} سجلاً مكرراً بالكامل من ورقة العمل "${sheetName}".`);
+        setShowDuplicateNotification(true);
+      } else {
+        setShowDuplicateNotification(false);
+      }
 
       if (resultProfile.columns.length > 0) {
         setSelectedVar(resultProfile.columns[0].name);
@@ -537,6 +1016,31 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Data Cleaning Settings */}
+                <div className="bento-card bg-slate-50 border border-slate-200/80 p-4 space-y-3">
+                  <h4 className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                    <Sliders className="w-4 h-4 text-blue-600" />
+                    خيارات تنظيف ومعالجة البيانات قبل الاستيراد والتحليل:
+                  </h4>
+                  <div className="flex flex-wrap items-center gap-6">
+                    <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={removeDuplicates}
+                        onChange={(e) => {
+                          const val = e.target.checked;
+                          setRemoveDuplicates(val);
+                          if (uploadedFile) {
+                            processUploadedFile(uploadedFile, val);
+                          }
+                        }}
+                        className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                      />
+                      <span>تطهير ومعالجة السجلات المكررة بالكامل (Remove identical duplicate records)</span>
+                    </label>
+                  </div>
+                </div>
+
                 {/* Demo Data & Directives Box */}
                 <div className="bento-card bg-white border border-slate-200">
                   <div className="flex items-start gap-4">
@@ -653,7 +1157,140 @@ export default function App() {
               className="space-y-8"
               id="dashboard-canvas"
             >
+              {/* Duplicate Records Removal Notification */}
+              {showDuplicateNotification && duplicateCountMsg && (
+                <motion.div
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex items-start justify-between gap-3 shadow-sm text-amber-950 text-xs md:text-sm font-semibold no-print"
+                >
+                  <div className="flex items-center gap-2.5 text-right">
+                    <div className="p-1.5 bg-amber-100 rounded-lg text-amber-700 shrink-0">
+                      <AlertCircle className="w-5 h-5" />
+                    </div>
+                    <span>{duplicateCountMsg}</span>
+                  </div>
+                  <button
+                    onClick={() => setShowDuplicateNotification(false)}
+                    className="text-amber-500 hover:text-amber-700 text-xs font-bold px-2 py-1 bg-white hover:bg-amber-100/50 rounded-lg border border-amber-200 transition-all cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    إغلاق الإشعار
+                  </button>
+                </motion.div>
+              )}
+
+              {/* Dashboard View Mode Controller */}
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 bg-white border border-slate-150 rounded-2xl shadow-sm no-print text-right">
+                <div className="space-y-0.5">
+                  <h3 className="text-xs md:text-sm font-bold text-slate-800 flex items-center justify-start gap-1.5" dir="rtl">
+                    <Sliders className="w-4 h-4 text-blue-600" />
+                    تخصيص نمط استعراض مخرجات التقرير الميداني:
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    اختر العرض المقسم بالتبويبات للتنقل السلس، أو نمط "التقرير الكامل" المتجاوب والمهيأ للطباعة مباشرة من المتصفح.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto" dir="rtl">
+                  {/* Switcher tabs/full */}
+                  <div className="bg-slate-100 p-1 rounded-xl flex border border-slate-250/60 shrink-0 w-full sm:w-auto">
+                    <button
+                      onClick={() => setViewMode('tabs')}
+                      className={`flex-1 sm:flex-none px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                        viewMode === 'tabs'
+                          ? 'bg-white text-blue-700 shadow-sm'
+                          : 'text-slate-500 hover:text-slate-700'
+                      }`}
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                      عرض التبويبات المتجاوبة
+                    </button>
+                    <button
+                      onClick={() => setViewMode('full')}
+                      className={`flex-1 sm:flex-none px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                        viewMode === 'full'
+                          ? 'bg-white text-blue-700 shadow-sm'
+                          : 'text-slate-500 hover:text-slate-700'
+                      }`}
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                      التقرير الكامل للطباعة (A4)
+                    </button>
+                  </div>
+
+                  {/* Print and Word Buttons if viewMode === 'full' */}
+                  {viewMode === 'full' && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        onClick={handlePrint}
+                        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all cursor-pointer shadow-sm select-none"
+                      >
+                        <Printer className="w-4 h-4" />
+                        طباعة التقرير (Print)
+                      </button>
+                      <button
+                        onClick={handleExportAsWord}
+                        className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all cursor-pointer shadow-sm select-none"
+                      >
+                        <FileText className="w-4 h-4" />
+                        تصدير التقرير والرسومات البيانية (.docx)
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Tabs Navigation for individual views */}
+              {viewMode === 'tabs' && (
+                <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-px no-print text-right" dir="rtl">
+                  <button
+                    onClick={() => setActiveTab('summary')}
+                    className={`px-4 py-2.5 border-b-2 text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                      activeTab === 'summary'
+                        ? 'border-blue-600 text-blue-600 bg-blue-50/20'
+                        : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+                    }`}
+                  >
+                    <Sparkles className="w-4 h-4 text-amber-500" />
+                    الملخص التنفيذي ومنهجية الفحص
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('univariate')}
+                    className={`px-4 py-2.5 border-b-2 text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                      activeTab === 'univariate'
+                        ? 'border-blue-600 text-blue-600 bg-blue-50/20'
+                        : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+                    }`}
+                  >
+                    <TrendingUp className="w-4 h-4 text-blue-600" />
+                    التحليل الوصفي الفردي للمتغيرات
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('bivariate')}
+                    className={`px-4 py-2.5 border-b-2 text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                      activeTab === 'bivariate'
+                        ? 'border-blue-600 text-blue-600 bg-blue-50/20'
+                        : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+                    }`}
+                  >
+                    <Sliders className="w-4 h-4 text-indigo-600" />
+                    دراسة وتحليل العلاقات والتباين
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('aggregated')}
+                    className={`px-4 py-2.5 border-b-2 text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                      activeTab === 'aggregated'
+                        ? 'border-blue-600 text-blue-600 bg-blue-50/20'
+                        : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+                    }`}
+                  >
+                    <Layers className="w-4 h-4 text-teal-600" />
+                    الأسئلة التجميعية
+                  </button>
+                </div>
+              )}
               {/* TOP ROW: BENTO - DATA SUMMARY & EXECUTIVE REPORT */}
+              {(viewMode === 'full' || activeTab === 'summary') && (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 
                  {/* Panel 1: Data Audit & Quality Metrics (5 cols) */}
@@ -720,7 +1357,7 @@ export default function App() {
                        <div className="flex items-center justify-between mb-1.5">
                          <h4 className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
                            <Sliders className="w-3.5 h-3.5 text-blue-600" />
-                           تضمين/استبعاد الأعمدة من التحليل:
+                           تضمين/استبعاد الأعمدة من التحليل: <span className="text-[9px] text-emerald-600 bg-emerald-50 border border-emerald-100 px-1.5 py-0.5 rounded font-bold">حفظ تلقائي</span>
                          </h4>
                          <button
                            onClick={() => setExcludedColumns([])}
@@ -731,10 +1368,36 @@ export default function App() {
                        </div>
                        <p className="text-[10px] text-slate-400 mb-3 leading-relaxed">
                          قم بإزالة التحديد عن أي عمود لاستبعاده نهائياً من العروض والجداول التكرارية والملف المصدّر.
+                        </p>
+
+                        {/* Column Name Search Field */}
+                        <div className="mb-3 relative no-print">
+                          <input
+                            type="text"
+                            placeholder="ابحث عن اسم العمود..."
+                            value={columnSearchQuery}
+                            onChange={(e) => setColumnSearchQuery(e.target.value)}
+                            className="w-full text-xs p-2.5 pl-8 bg-slate-50/80 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500 font-semibold text-slate-700 text-right placeholder-slate-400 shadow-sm"
+                            dir="rtl"
+                          />
+                          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                          {columnSearchQuery && (
+                            <button
+                              onClick={() => setColumnSearchQuery('')}
+                              className="text-[10px] text-slate-400 hover:text-slate-600 absolute left-8 top-1/2 -translate-y-1/2 font-bold"
+                            >
+                              مسح
+                            </button>
+                          )}
+                        </div>
+
+                        <p className="hidden">
                        </p>
                        
                        <div className="max-h-48 overflow-y-auto border border-slate-150 rounded-lg p-1.5 bg-slate-50/40 space-y-1.5" dir="ltr">
-                         {(profile.columns || []).map(col => {
+                         {(profile.columns || [])
+                            .filter(col => col.name.toLowerCase().includes(columnSearchQuery.toLowerCase()))
+                            .map(col => {
                            const isExcluded = excludedColumns.includes(col.name);
                            return (
                              <label 
@@ -835,7 +1498,10 @@ export default function App() {
 
               </div>
 
+              )}
+
               {/* SECOND ROW: UNIVARIATE COMPREHENSIVE ANALYSIS (DESCRIPTIVE) */}
+              {(viewMode === 'full' || activeTab === 'univariate') && (
               <div className="bento-card" id="univariate-section">
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 pb-4 border-b border-slate-100">
                   <div>
@@ -982,8 +1648,26 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* Low Frequency / Missing Warn System */}
+                      {/* Low Frequency / Missing / Outlier Warn System */}
                       <div className="space-y-2">
+                        {activeColProfile.outlierInfo && (
+                          <div className="p-3 bg-rose-50/70 border border-rose-200 rounded-xl text-[11px] text-rose-900 flex items-start gap-2.5 shadow-sm">
+                            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                            <div className="space-y-1 w-full">
+                              <span className="font-bold block mb-0.5 text-rose-800">تنبيه قيم متطرفة (Outliers Detected):</span>
+                              <p className="leading-relaxed">
+                                تم رصد <strong className="text-rose-700">{activeColProfile.outlierInfo.count} قيم متطرفة</strong> ({activeColProfile.outlierInfo.percentage}% من السجلات) خارج النطاق الطبيعي للبيانات المتوقعة ({activeColProfile.outlierInfo.lowerBound} إلى {activeColProfile.outlierInfo.upperBound}).
+                              </p>
+                              <div className="bg-white/80 border border-rose-100 p-2 rounded-lg text-[10px] space-y-0.5 font-mono leading-relaxed">
+                                <div><strong>أمثلة قيم متطرفة:</strong> {activeColProfile.outlierInfo.values.join(' ، ')}</div>
+                                <div className="text-rose-700"><strong>مؤشر الأثر:</strong> {activeColProfile.outlierInfo.impactDescription}</div>
+                              </div>
+                              <p className="text-slate-600 leading-relaxed pt-1">
+                                <strong>توصية النظام:</strong> {activeColProfile.outlierInfo.recommendation}
+                              </p>
+                            </div>
+                          </div>
+                        )}
                         {activeColProfile.frequencies.some(f => f.percentage < 5) && (
                           <div className="p-3 bg-amber-50 border border-amber-100 rounded-xl text-[11px] text-amber-800 flex items-start gap-2.5">
                             <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
@@ -1021,7 +1705,7 @@ export default function App() {
                               {showGridlines && <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />}
                               <XAxis dataKey="name" stroke="#64748b" fontSize={11} tickLine={false} />
                               <YAxis stroke="#64748b" fontSize={11} tickLine={false} />
-                              <Tooltip formatter={(value, name) => [value, name]} />
+                              <Tooltip content={<CustomTooltip />} />
                               <Line type="monotone" dataKey="التكرار" stroke={PALETTE_COLORS[paletteName]?.[0] || '#2563eb'} strokeWidth={3} activeDot={{ r: 6 }} />
                             </LineChart>
                           ) : chartType === 'area' ? (
@@ -1032,7 +1716,7 @@ export default function App() {
                               {showGridlines && <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />}
                               <XAxis dataKey="name" stroke="#64748b" fontSize={11} tickLine={false} />
                               <YAxis stroke="#64748b" fontSize={11} tickLine={false} />
-                              <Tooltip formatter={(value, name) => [value, name]} />
+                              <Tooltip content={<CustomTooltip />} />
                               <Area type="monotone" dataKey="التكرار" fill={PALETTE_COLORS[paletteName]?.[0] || '#2563eb'} fillOpacity={0.2} stroke={PALETTE_COLORS[paletteName]?.[0] || '#2563eb'} strokeWidth={2} />
                             </AreaChart>
                           ) : (
@@ -1043,7 +1727,7 @@ export default function App() {
                               {showGridlines && <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />}
                               <XAxis dataKey="name" stroke="#64748b" fontSize={11} tickLine={false} />
                               <YAxis stroke="#64748b" fontSize={11} tickLine={false} />
-                              <Tooltip formatter={(value, name) => [value, name]} />
+                              <Tooltip content={<CustomTooltip />} />
                               <Bar dataKey="التكرار" radius={[4, 4, 0, 0]}>
                                 {chartData.map((entry, index) => (
                                   <Cell key={`cell-${index}`} fill={entry.fill} />
@@ -1058,7 +1742,10 @@ export default function App() {
                 )}
               </div>
 
+              )}
+
               {/* THIRD ROW: BIVARIATE RELATIONSHIPS & CROSSTABULATION ENGINE */}
+              {(viewMode === 'full' || activeTab === 'bivariate') && (
               <div className="bento-card" id="bivariate-section">
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 pb-4 border-b border-slate-100">
                   <div>
@@ -1104,133 +1791,171 @@ export default function App() {
                 </div>
 
                 {activeCrosstab && (
-                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                    {/* Bivariate Heatmap Table */}
-                    <div className="lg:col-span-6 space-y-6">
-                      <div>
-                        {/* Summary Badges of Relationship */}
-                        <div className="flex flex-wrap gap-2 mb-4">
-                          <span className="text-slate-500 text-xs flex items-center gap-1 font-semibold">
-                            طبيعة الترابط:
-                          </span>
-                          <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold border ${
-                            activeCrosstab.relationshipStrength === 'strong' ? 'bg-rose-50 border-rose-100 text-rose-700' :
-                            activeCrosstab.relationshipStrength === 'moderate' ? 'bg-amber-50 border-amber-100 text-amber-700' :
-                            activeCrosstab.relationshipStrength === 'weak' ? 'bg-blue-50 border-blue-100 text-blue-700' :
-                            'bg-slate-50 border-slate-200 text-slate-700'
-                          }`}>
-                            {activeCrosstab.relationshipStrength === 'strong' ? 'علاقة قوية ومؤثرة جداً' :
-                             activeCrosstab.relationshipStrength === 'moderate' ? 'علاقة متوسطة الأثر' :
-                             activeCrosstab.relationshipStrength === 'weak' ? 'علاقة تباين محدودة' :
-                             'لا ترابط مباشر ملموس'}
-                          </span>
-                          <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold border ${
-                            activeCrosstab.relationshipType === 'direct' ? 'bg-emerald-50 border-emerald-100 text-emerald-700' :
-                            activeCrosstab.relationshipType === 'inverse' ? 'bg-sky-50 border-sky-100 text-sky-700' :
-                            'bg-indigo-50 border-indigo-100 text-indigo-700'
-                          }`}>
-                            {activeCrosstab.relationshipType === 'direct' ? 'اتجاه طردي (إيجابي)' :
-                             activeCrosstab.relationshipType === 'inverse' ? 'اتجاه عكسي (سلبي)' :
-                             'تباين معقد/فئات متداخلة'}
-                          </span>
-                        </div>
-
-                        {/* Pivot Table Markup */}
-                        <div className="overflow-x-auto rounded-lg border border-slate-200">
-                          <table className="w-full text-right text-xs">
-                            <thead>
-                              <tr className="bg-slate-50 text-slate-700 font-bold border-b border-slate-200">
-                                <th className="px-3 py-3 border-l border-slate-200">
-                                  {activeCrosstab.rowVar} / {activeCrosstab.colVar}
-                                </th>
-                                {activeCrosstab.colValues.map(c => (
-                                  <th key={c} className="px-3 py-3 text-center border-l border-slate-200 last:border-l-0">
-                                    {c}
-                                  </th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-100">
-                              {activeCrosstab.rowValues.map(r => (
-                                <tr key={r} className="hover:bg-slate-50/50">
-                                  <td className="px-3 py-2.5 font-bold text-slate-800 border-l border-slate-200 bg-slate-50/30">
-                                    {r}
-                                  </td>
-                                  {activeCrosstab.colValues.map(c => {
-                                    const cell = activeCrosstab.matrix[r]?.[c];
-                                    const pct = cell ? cell.percentage : 0;
-                                    const count = cell ? cell.count : 0;
-                                    
-                                    // Generate soft background shade depending on intensity of percentage
-                                    const intensity = Math.min(95, Math.max(0, pct * 0.8));
-                                    const bgColor = pct > 0 ? `rgba(37, 99, 235, ${intensity / 100})` : 'transparent';
-                                    const textColor = pct > 40 ? '#ffffff' : '#1e293b';
-
-                                    return (
-                                      <td 
-                                        key={c} 
-                                        className="px-3 py-2.5 text-center border-l border-slate-200 last:border-l-0 font-mono transition-all"
-                                        style={{ backgroundColor: bgColor, color: textColor }}
-                                      >
-                                        <div className="font-bold">{pct.toFixed(1)}%</div>
-                                        <div className="text-[10px] opacity-75">({count} سجل)</div>
-                                      </td>
-                                    );
-                                  })}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-
-                      {/* Summary Arabic analytical narrative of the crosstab */}
-                      <div className="p-4 bg-blue-50/50 border border-blue-100 rounded-xl">
-                        <div className="flex items-center gap-2 text-blue-800 text-xs font-bold mb-2">
-                          <Compass className="w-4 h-4" />
-                          تفسير العلاقة الإحصائية المستخلصة:
-                        </div>
-                        <p className="text-slate-700 text-xs md:text-sm leading-relaxed text-justify">
-                          {activeCrosstab.insight}
-                        </p>
+                  <div className="space-y-4">
+                    {/* Direct Export options for specific crosstab */}
+                    <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-blue-50/40 border border-blue-100 rounded-xl" id="crosstab-direct-export-controls">
+                      <span className="text-xs text-blue-800 font-bold flex items-center gap-1.5">
+                        <Compass className="w-4 h-4 text-blue-600 animate-pulse" />
+                        أدوات تصدير سريعة لدراسة العلاقات الحالية:
+                      </span>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleExportCrosstab('png')}
+                          disabled={exportingCrosstab}
+                          className="px-3.5 py-1.5 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-extrabold rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+                        >
+                          <Download className="w-3.5 h-3.5 text-emerald-600" />
+                          تصدير الجدول والرسم كـ PNG
+                        </button>
+                        <button
+                          onClick={() => handleExportCrosstab('pdf')}
+                          disabled={exportingCrosstab}
+                          className="px-3.5 py-1.5 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-extrabold rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+                        >
+                          <FileText className="w-3.5 h-3.5 text-rose-600" />
+                          تصدير كتقرير PDF منفصل
+                        </button>
                       </div>
                     </div>
 
-                    {/* Chart Visualization - Stacked Bar Chart */}
-                    <div className="lg:col-span-6 bg-slate-50/40 rounded-xl p-4 border border-slate-100 flex flex-col justify-center">
-                      <h4 className="text-xs font-bold text-slate-500 mb-4 text-center uppercase tracking-wide">
-                        التمثيل المشترك لعلاقة "{activeCrosstab.rowVar}" حسب فئات "{activeCrosstab.colVar}"
-                      </h4>
+                    <div id="crosstab-export-container" className="bg-white border border-slate-150 rounded-2xl p-6 shadow-sm space-y-6">
+                      <div className="border-b border-slate-100 pb-3 mb-2">
+                        <h4 className="text-slate-800 font-bold text-sm">دراسة العلاقات التفصيلية وتحليل الأثر المشترك</h4>
+                        <p className="text-[11px] text-slate-400 mt-0.5">تقاطع متغير "{activeCrosstab.rowVar}" مع متغير ديموغرافي/تصنيفي "{activeCrosstab.colVar}"</p>
+                      </div>
 
-                      <div className="w-full h-72">
-                        <ResponsiveContainer width="100%" height="100%">
-                          <BarChart
-                            data={stackedChartData}
-                            margin={{ top: 20, right: 10, left: 0, bottom: 20 }}
-                          >
-                            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                            <XAxis dataKey="name" stroke="#64748b" fontSize={11} tickLine={false} />
-                            <YAxis stroke="#64748b" fontSize={11} tickLine={false} unit="%" />
-                            <Tooltip formatter={(value) => [`${value}%`]} />
-                            <Legend wrapperStyle={{ fontSize: '11px' }} />
-                            {activeCrosstab.colValues.map((c, index) => (
-                              <Bar 
-                                key={c} 
-                                dataKey={c} 
-                                name={c} 
-                                stackId="a" 
-                                fill={CHART_COLORS[index % CHART_COLORS.length]} 
-                              />
-                            ))}
-                          </BarChart>
-                        </ResponsiveContainer>
+                      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                        {/* Bivariate Heatmap Table */}
+                        <div className="lg:col-span-6 space-y-6">
+                          <div>
+                            {/* Summary Badges of Relationship */}
+                            <div className="flex flex-wrap gap-2 mb-4">
+                              <span className="text-slate-500 text-xs flex items-center gap-1 font-semibold">
+                                طبيعة الترابط:
+                              </span>
+                              <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold border ${
+                                activeCrosstab.relationshipStrength === 'strong' ? 'bg-rose-50 border-rose-100 text-rose-700' :
+                                activeCrosstab.relationshipStrength === 'moderate' ? 'bg-amber-50 border-amber-100 text-amber-700' :
+                                activeCrosstab.relationshipStrength === 'weak' ? 'bg-blue-50 border-blue-100 text-blue-700' :
+                                'bg-slate-50 border-slate-200 text-slate-700'
+                              }`}>
+                                {activeCrosstab.relationshipStrength === 'strong' ? 'علاقة قوية ومؤثرة جداً' :
+                                 activeCrosstab.relationshipStrength === 'moderate' ? 'علاقة متوسطة الأثر' :
+                                 activeCrosstab.relationshipStrength === 'weak' ? 'علاقة تباين محدودة' :
+                                 'لا ترابط مباشر ملموس'}
+                              </span>
+                              <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold border ${
+                                activeCrosstab.relationshipType === 'direct' ? 'bg-emerald-50 border-emerald-100 text-emerald-700' :
+                                activeCrosstab.relationshipType === 'inverse' ? 'bg-sky-50 border-sky-100 text-sky-700' :
+                                'bg-indigo-50 border-indigo-100 text-indigo-700'
+                              }`}>
+                                {activeCrosstab.relationshipType === 'direct' ? 'اتجاه طردي (إيجابي)' :
+                                 activeCrosstab.relationshipType === 'inverse' ? 'اتجاه عكسي (سلبي)' :
+                                 'تباين معقد/فئات متداخلة'}
+                              </span>
+                            </div>
+
+                            {/* Pivot Table Markup */}
+                            <div className="overflow-x-auto rounded-lg border border-slate-200">
+                              <table className="w-full text-right text-xs">
+                                <thead>
+                                  <tr className="bg-slate-50 text-slate-700 font-bold border-b border-slate-200">
+                                    <th className="px-3 py-3 border-l border-slate-200">
+                                      {activeCrosstab.rowVar} / {activeCrosstab.colVar}
+                                    </th>
+                                    {activeCrosstab.colValues.map(c => (
+                                      <th key={c} className="px-3 py-3 text-center border-l border-slate-200 last:border-l-0">
+                                        {c}
+                                      </th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                  {activeCrosstab.rowValues.map(r => (
+                                    <tr key={r} className="hover:bg-slate-50/50">
+                                      <td className="px-3 py-2.5 font-bold text-slate-800 border-l border-slate-200 bg-slate-50/30">
+                                        {r}
+                                      </td>
+                                      {activeCrosstab.colValues.map(c => {
+                                        const cell = activeCrosstab.matrix[r]?.[c];
+                                        const pct = cell ? cell.percentage : 0;
+                                        const count = cell ? cell.count : 0;
+                                        
+                                        // Generate soft background shade depending on intensity of percentage
+                                        const intensity = Math.min(95, Math.max(0, pct * 0.8));
+                                        const bgColor = pct > 0 ? `rgba(37, 99, 235, ${intensity / 100})` : 'transparent';
+                                        const textColor = pct > 40 ? '#ffffff' : '#1e293b';
+
+                                        return (
+                                          <td 
+                                            key={c} 
+                                            className="px-3 py-2.5 text-center border-l border-slate-200 last:border-l-0 font-mono transition-all"
+                                            style={{ backgroundColor: bgColor, color: textColor }}
+                                          >
+                                            <div className="font-bold">{pct.toFixed(1)}%</div>
+                                            <div className="text-[10px] opacity-75">({count} سجل)</div>
+                                          </td>
+                                        );
+                                      })}
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+
+                          {/* Summary Arabic analytical narrative of the crosstab */}
+                          <div className="p-4 bg-blue-50/50 border border-blue-100 rounded-xl">
+                            <div className="flex items-center gap-2 text-blue-800 text-xs font-bold mb-2">
+                              <Compass className="w-4 h-4" />
+                              تفسير العلاقة الإحصائية المستخلصة:
+                            </div>
+                            <p className="text-slate-700 text-xs md:text-sm leading-relaxed text-justify">
+                              {activeCrosstab.insight}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Chart Visualization - Stacked Bar Chart */}
+                        <div className="lg:col-span-6 bg-slate-50/40 rounded-xl p-4 border border-slate-100 flex flex-col justify-center">
+                          <h4 className="text-xs font-bold text-slate-500 mb-4 text-center uppercase tracking-wide">
+                            التمثيل المشترك لعلاقة "{activeCrosstab.rowVar}" حسب فئات "{activeCrosstab.colVar}"
+                          </h4>
+
+                          <div className="w-full h-72">
+                            <ResponsiveContainer width="100%" height="100%">
+                              <BarChart
+                                data={stackedChartData}
+                                margin={{ top: 20, right: 10, left: 0, bottom: 20 }}
+                              >
+                                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                                <XAxis dataKey="name" stroke="#64748b" fontSize={11} tickLine={false} />
+                                <YAxis stroke="#64748b" fontSize={11} tickLine={false} unit="%" />
+                                <Tooltip formatter={(value) => [`${value}%`]} />
+                                <Legend wrapperStyle={{ fontSize: '11px' }} />
+                                {activeCrosstab.colValues.map((c, index) => (
+                                  <Bar 
+                                    key={c} 
+                                    dataKey={c} 
+                                    name={c} 
+                                    stackId="a" 
+                                    fill={CHART_COLORS[index % CHART_COLORS.length]} 
+                                  />
+                                ))}
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
                 )}
               </div>
 
+              )}
+
               {/* THIRD ROW: AGGREGATED STATISTICS FOR MATCHING CHOICES QUESTIONS */}
+              {(viewMode === 'full' || activeTab === 'aggregated') && (
               <div className="bento-card bg-white border border-slate-200" id="aggregated-stats-section">
                 <div className="flex items-center gap-2 mb-6 pb-4 border-b border-slate-100">
                   <Layers className="w-5 h-5 text-indigo-600" />
@@ -1299,7 +2024,10 @@ export default function App() {
                 )}
               </div>
 
+              )}
+
               {/* FOURTH ROW: DETAILED AI STATISTICAL REPORT & ACTIONABLE RECOMMENDATIONS */}
+              {(viewMode === 'full' || activeTab === 'summary') && (
               <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm" id="detailed-report-section">
                 <div className="flex items-center gap-2 mb-6 pb-4 border-b border-stone-100">
                   <FileText className="w-5 h-5 text-teal-600" />
@@ -1351,6 +2079,8 @@ export default function App() {
                 </div>
               </div>
 
+              )}
+
               {/* FIFTH ROW: FINAL DOWNLOAD ACTIONS BANNER */}
               <div className="bg-teal-900 text-white rounded-3xl p-8 shadow-md flex flex-col md:flex-row justify-between items-center gap-6" id="export-banner">
                 <div className="text-center md:text-right">
@@ -1373,6 +2103,109 @@ export default function App() {
           )}
         </AnimatePresence>
       </main>
+
+      {/* Print Warning Modal for iframe environment */}
+      <AnimatePresence>
+        {showPrintModal && (
+          <div className="fixed inset-0 z-50 overflow-y-auto no-print" dir="rtl">
+            {/* Backdrop */}
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowPrintModal(false)}
+              className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs transition-opacity"
+            />
+
+            <div className="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                className="relative transform overflow-hidden rounded-3xl bg-white text-right shadow-2xl transition-all sm:my-8 sm:w-full sm:max-w-lg border border-slate-200"
+              >
+                {/* Header Accent Bar */}
+                <div className="h-2 bg-gradient-to-r from-amber-500 via-orange-500 to-red-500" />
+                
+                <div className="p-6 md:p-8 space-y-6">
+                  {/* Icon & Title */}
+                  <div className="flex items-start gap-4">
+                    <div className="p-3 bg-amber-50 rounded-2xl text-amber-600 border border-amber-100 shrink-0">
+                      <AlertCircle className="w-6 h-6" />
+                    </div>
+                    <div className="space-y-1">
+                      <h3 className="text-base md:text-lg font-black text-slate-800 leading-snug">
+                        تنبيه هام: يتطلب تشغيل الطباعة فتح التطبيق خارج المنصة
+                      </h3>
+                      <p className="text-xs text-slate-500 leading-relaxed font-semibold">
+                        بسبب قيود الأمان لمتصفحات الإنترنت في التعامل مع الإطارات البرمجية المدمجة (iFrame)
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Clarification Box */}
+                  <div className="bg-slate-50 border border-slate-150 rounded-2xl p-4.5 space-y-4 text-xs md:text-sm text-slate-700 leading-relaxed font-medium">
+                    <p className="font-bold text-slate-800">
+                      أمان المتصفح يمنع تشغيل أمر الطباعة أو الاستعراض المباشر من داخل الإطار البرمجي الخاص بمنصة AI Studio.
+                    </p>
+                    
+                    <div className="space-y-3 pt-2">
+                      <p className="font-bold text-blue-700 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-blue-600 shrink-0" />
+                        للطباعة أو الحفظ بصيغة PDF يرجى اتباع الخطوات التالية:
+                      </p>
+                      <ul className="space-y-2.5 list-none pr-3">
+                        <li className="flex items-start gap-2 text-slate-600">
+                          <span className="text-blue-500 font-extrabold text-[13px]">1.</span>
+                          <span>
+                            اضغط على زر <strong>"فتح في علامة تبويب جديدة" (Open in new tab)</strong> أو أيقونة السهم المتواجدة أعلى لوحة معاينة التطبيق في منصة AI Studio.
+                          </span>
+                        </li>
+                        <li className="flex items-start gap-2 text-slate-600">
+                          <span className="text-blue-500 font-extrabold text-[13px]">2.</span>
+                          <span>
+                            بعد فتح التطبيق في صفحة متصفح مستقلة ومكتملة، اختر خيار <strong>"التقرير الكامل للطباعة (A4)"</strong> من الأسفل لتجهيز العرض.
+                          </span>
+                        </li>
+                        <li className="flex items-start gap-2 text-slate-600">
+                          <span className="text-blue-500 font-extrabold text-[13px]">3.</span>
+                          <span>
+                            اضغط على زر <strong>"طباعة التقرير"</strong> لتفتح لك نافذة الطباعة الافتراضية الخاصة بمتصفحك بشكل سليم ومباشر!
+                          </span>
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  {/* Buttons */}
+                  <div className="flex flex-col sm:flex-row-reverse gap-3 pt-2">
+                    <button
+                      onClick={() => {
+                        setShowPrintModal(false);
+                        try {
+                          window.print();
+                        } catch (e) {
+                          console.error(e);
+                        }
+                      }}
+                      className="w-full sm:flex-1 px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all cursor-pointer border border-slate-250/60 flex items-center justify-center gap-1.5"
+                    >
+                      <Printer className="w-4 h-4" />
+                      محاولة تشغيل الطباعة على أي حال
+                    </button>
+                    <button
+                      onClick={() => setShowPrintModal(false)}
+                      className="w-full sm:flex-1 px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition-all cursor-pointer shadow-sm flex items-center justify-center"
+                    >
+                      فهمت ذلك، إغلاق الإرشاد
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

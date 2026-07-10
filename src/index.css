@@ -76,3 +76,64 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }
+
+/* Elegant Print Styles */
+@media print {
+  body {
+    background: white !important;
+    background-color: white !important;
+    color: #111827 !important;
+    font-size: 12pt !important;
+  }
+  /* Hide interactive controls, upload boxes, and buttons from print */
+  header, 
+  #reset-btn-top,
+  #export-btn-top,
+  #export-banner,
+  #upload-container,
+  #upload-guidelines,
+  .no-print,
+  button,
+  select,
+  input,
+  .interactive-control {
+    display: none !important;
+  }
+  /* Reset container widths and remove shadows */
+  .max-w-7xl, main, .container {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  /* Expand the main content grid */
+  .grid {
+    display: block !important;
+  }
+  /* Clean styling for bento cards during printing */
+  .bento-card {
+    border: 1px solid #94a3b8 !important;
+    box-shadow: none !important;
+    background: white !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    margin-bottom: 1.5rem !important;
+    padding: 1.5rem !important;
+  }
+  /* Force dark text for print readability */
+  .text-slate-500, .text-slate-400, .text-stone-500, .text-slate-600 {
+    color: #374151 !important;
+  }
+  .stat-val {
+    color: #111827 !important;
+  }
+  /* Ensure page breaks do not cut off charts or key sections */
+  #univariate-section,
+  #bivariate-section,
+  #aggregated-stats-section,
+  #detailed-report-section {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+}
+
